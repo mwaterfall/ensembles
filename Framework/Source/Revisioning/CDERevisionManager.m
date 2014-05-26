@@ -219,7 +219,7 @@
     
     BOOL isDir;
     if (![fileManager fileExistsAtPath:url.path isDirectory:&isDir]) {
-        @throw [NSException exceptionWithName:CDEException reason:@"Could not find model file" userInfo:nil];
+        @throw [NSException exceptionWithName:CDEException reason:[NSString stringWithFormat:@"Could not find model file at %@", url] userInfo:nil];
     }
     else if (!isDir) {
         // A single file is an unversioned model
