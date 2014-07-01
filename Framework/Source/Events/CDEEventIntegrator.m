@@ -137,7 +137,7 @@
     newEventUniqueId = nil;
     
     // Setup a context for accessing the main store
-    NSError *error;
+    NSError *error = nil;
     NSPersistentStoreCoordinator *coordinator = [[NSPersistentStoreCoordinator alloc] initWithManagedObjectModel:managedObjectModel];
     NSPersistentStore *persistentStore = [coordinator addPersistentStoreWithType:NSSQLiteStoreType configuration:nil URL:storeURL options:self.persistentStoreOptions error:&error];
     if (!persistentStore) {
@@ -217,7 +217,9 @@
             }
 
             // Notify of save
-            if (didSaveBlock) didSaveBlock(managedObjectContext, saveInfoDictionary);
+            [self.managedObjectContext performBlockAndWait:^{
+                if (didSaveBlock) didSaveBlock(managedObjectContext, saveInfoDictionary);
+            }];
             saveInfoDictionary = nil;
             
             // Complete
@@ -265,6 +267,7 @@
     }
     if (newEventUniqueId) [self.eventStore deregisterIncompleteEventIdentifier:newEventUniqueId];
     newEventUniqueId = nil;
+    managedObjectContext = nil;
     
     dispatch_async(dispatch_get_main_queue(), ^{
         if (completion) completion(error);
@@ -275,6 +278,7 @@
 {
     if (newEventUniqueId) [self.eventStore deregisterIncompleteEventIdentifier:newEventUniqueId];
     newEventUniqueId = nil;
+    managedObjectContext = nil;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (completion) completion(nil);
     });
@@ -286,11 +290,20 @@
 - (BOOL)needsFullIntegration
 {
     // Determine if we need to do a full integration of all data.
-    // This is the case if the baseline identity has changed.
+    // First case is if the baseline identity has changed.
     NSString *storeBaselineId = self.eventStore.identifierOfBaselineUsedToConstructStore;
     NSString *currentBaselineId = self.eventStore.currentBaselineIdentifier;
-    BOOL needFullIntegration = !storeBaselineId || ![storeBaselineId isEqualToString:currentBaselineId];
-    return needFullIntegration;
+    if (!storeBaselineId || ![storeBaselineId isEqualToString:currentBaselineId]) return YES;
+    
+    // Determine if a full integration is needed due to abandonment during rebasing
+    // This is the case if no events exist that are newer than the baseline.
+    CDERevisionManager *revisionManager = [[CDERevisionManager alloc] initWithEventStore:self.eventStore];
+    NSError *error = nil;
+    BOOL passed = [revisionManager checkThatLocalPersistentStoreHasNotBeenAbandoned:&error];
+    if (error) CDELog(CDELoggingLevelError, @"Error determining if store is abandoned: %@", error);
+    if (!passed) return YES;
+    
+    return NO;
 }
 
 // Called on background queue.
@@ -352,13 +365,20 @@
         NSMutableDictionary *insertedObjectIDsByEntity = needFullIntegration ? [[NSMutableDictionary alloc] init] : nil;
         for (CDEStoreModificationEvent *storeModEvent in storeModEvents) {
             @autoreleasepool {
+                // Determine which entities have changes
+                NSSet *changedEntityNames = [storeModEvent.objectChanges valueForKeyPath:@"nameOfEntity"];
+                NSMutableArray *changedEntities = [[changedEntityNames.allObjects cde_arrayByTransformingObjectsWithBlock:^(NSString *name) {
+                    return managedObjectModel.entitiesByName[name];
+                }] mutableCopy];
+                [changedEntities removeObject:[NSNull null]];
+                
                 // Insertions are split into two parts: first, we perform an insert without applying property changes,
                 // and later, we do an update to set the properties.
                 // This is because the object inserts must be carried out before trying to set relationships,
                 // otherwise related objects may not exist. So we create objects first, and only
                 // set relationships in the next phase.
                 NSMutableDictionary *appliedInsertsByEntity = [NSMutableDictionary dictionary];
-                for (NSEntityDescription *entity in managedObjectModel) {
+                for (NSEntityDescription *entity in changedEntities) {
                     NSArray *appliedInsertChanges = [self insertObjectsForStoreModificationEvents:@[storeModEvent] entity:entity error:error];
                     if (!appliedInsertChanges) {
                         success = NO;
@@ -372,14 +392,14 @@
                 
                 // Now that all objects exist, we can apply property changes.
                 // We treat insertions on a par with updates here.
-                for (NSEntityDescription *entity in managedObjectModel) {
+                for (NSEntityDescription *entity in changedEntities) {
                     NSArray *inserts = appliedInsertsByEntity[entity.name];
                     success = [self updateObjectsForStoreModificationEvents:@[storeModEvent] entity:entity includingInsertedObjects:inserts error:error];
                     if (!success) return;
                 }
                 
                 // Finally deletions
-                for (NSEntityDescription *entity in managedObjectModel) {
+                for (NSEntityDescription *entity in changedEntities) {
                     success = [self deleteObjectsForStoreModificationEvents:@[storeModEvent] entity:entity error:error];
                     if (!success) return;
                 }
@@ -502,7 +522,7 @@
             }
             else {
                 NSManagedObjectID *objectID = [managedObjectContext.persistentStoreCoordinator managedObjectIDForURIRepresentation:url];
-                NSManagedObject *object = [managedObjectContext existingObjectWithID:objectID error:NULL];
+                NSManagedObject *object = objectID ? [managedObjectContext existingObjectWithID:objectID error:NULL] : nil;
                 objectNeedsCreating = !object || object.isDeleted || nil == object.managedObjectContext;
             }
             if (objectNeedsCreating) [indexesNeedingNewObjects addObject:@(i)];
@@ -613,7 +633,7 @@
     NSMapTable *objectsByGlobalId = [self fetchObjectsByGlobalIdentifierForObjectChanges:changes error:error];
     if (!objectsByGlobalId) return NO;
     
-    NSMapTable *globalIdsByObject = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *globalIdsByObject = [NSMapTable cde_strongToStrongObjectsMapTable];
     for (CDEGlobalIdentifier *globalId in objectsByGlobalId) {
         id object = [objectsByGlobalId objectForKey:globalId];
         [globalIdsByObject setObject:globalId forKey:object];
@@ -741,7 +761,7 @@
         
         // Merge indexes for global ids
         NSMutableOrderedSet *relatedObjects = [object mutableOrderedSetValueForKey:relationshipChange.propertyName];
-        NSMapTable *finalIndexesByObject = [NSMapTable strongToStrongObjectsMapTable];
+        NSMapTable *finalIndexesByObject = [NSMapTable cde_strongToStrongObjectsMapTable];
         for (NSUInteger index = 0; index < relatedObjects.count; index++) {
             [finalIndexesByObject setObject:@(index) forKey:relatedObjects[index]];
         }
@@ -858,7 +878,7 @@
     // Setup mappings between types of identifiers
     NSPersistentStoreCoordinator *coordinator = managedObjectContext.persistentStoreCoordinator;
     NSMutableSet *objectIDs = [[NSMutableSet alloc] initWithCapacity:[globalIdentifiers count]];
-    NSMapTable *objectIDByGlobalId = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *objectIDByGlobalId = [NSMapTable cde_strongToStrongObjectsMapTable];
     for (CDEGlobalIdentifier *globalId in globalIdentifiers) {
         NSString *storeIdString = globalId.storeURI;
         if (!storeIdString) continue; // Doesn't exist in store
@@ -886,7 +906,7 @@
     NSDictionary *objectByObjectID = [[NSDictionary alloc] initWithObjects:objects forKeys:objectIDsOfFetched];
     
     // Prepare results
-    NSMapTable *result = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *result = [NSMapTable cde_strongToStrongObjectsMapTable];
     for (CDEGlobalIdentifier *globalId in globalIdentifiers) {
         NSManagedObjectID *objectID = [objectIDByGlobalId objectForKey:globalId];
         [result setObject:objectByObjectID[objectID] forKey:globalId];
@@ -908,7 +928,7 @@
     // to sort an ordered relationship, and this involves all objects, whether they are new or not.
     NSMapTable *relatedOrderedObjectsByIdString = [self fetchObjectsByIdStringForRelatedObjectsInOrderedRelationshipsOfObjectChanges:objectChanges];
     
-    NSMapTable *result = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *result = [NSMapTable cde_strongToStrongObjectsMapTable];
     [result cde_addEntriesFromMapTable:changeObjectsByIdString];
     [result cde_addEntriesFromMapTable:relatedOrderedObjectsByIdString];
     
@@ -917,7 +937,7 @@
 
 - (NSMapTable *)fetchObjectsByIdStringForRelatedObjectsInOrderedRelationshipsOfObjectChanges:(id)objectChanges
 {
-    NSMapTable *changedOrderedPropertiesByGlobalId = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *changedOrderedPropertiesByGlobalId = [NSMapTable cde_strongToStrongObjectsMapTable];
     for (CDEObjectChange *change in objectChanges) {
         NSArray *propertyChangeValues = change.propertyChangeValues;
         for (CDEPropertyChangeValue *value in propertyChangeValues) {
@@ -952,7 +972,7 @@
     NSArray *objectIDs = [relatedObjects valueForKeyPath:@"objectID"];
     NSArray *globalIds = [CDEGlobalIdentifier fetchGlobalIdentifiersForObjectIDs:objectIDs inManagedObjectContext:self.eventStore.managedObjectContext];
 
-    NSMapTable *relatedObjectsByGlobalId = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *relatedObjectsByGlobalId = [NSMapTable cde_strongToStrongObjectsMapTable];
     [relatedObjects enumerateObjectsUsingBlock:^(id object, NSUInteger index, BOOL *stop) {
         CDEGlobalIdentifier *globalId = globalIds[index];
         if (globalId == (id)[NSNull null]) {
@@ -968,7 +988,7 @@
 - (NSMapTable *)fetchObjectsByIdStringForGlobalIdentifiers:(NSArray *)globalIds
 {
     NSDictionary *globalIdsByEntityName = [self entityGroupedGlobalIdentifiersForIdentifiers:globalIds];
-    NSMapTable *results = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *results = [NSMapTable cde_strongToStrongObjectsMapTable];
     for (NSString *entityName in globalIdsByEntityName) {
         NSSet *entityGlobalIds = globalIdsByEntityName[entityName];
         NSError *error;
@@ -1080,14 +1100,7 @@
 
 - (void)storeChangesFromContextDidSaveNotification:(NSNotification *)notif
 {
-    NSMutableDictionary *info = [[NSMutableDictionary alloc] initWithCapacity:3];
-    id insertedIds = [notif.userInfo[NSInsertedObjectsKey] valueForKeyPath:@"objectID"];
-    id updatedIds = [notif.userInfo[NSUpdatedObjectsKey] valueForKeyPath:@"objectID"];
-    id deletedIds = [notif.userInfo[NSDeletedObjectsKey] valueForKeyPath:@"objectID"];
-    if (insertedIds) info[NSInsertedObjectsKey] = insertedIds;
-    if (updatedIds) info[NSUpdatedObjectsKey] = updatedIds;
-    if (deletedIds) info[NSDeletedObjectsKey] = deletedIds;
-    saveInfoDictionary = info;
+    saveInfoDictionary = notif.userInfo;
 }
 
 @end

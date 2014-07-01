@@ -9,6 +9,7 @@
 #import "CDERebaser.h"
 #import "NSManagedObjectModel+CDEAdditions.h"
 #import "CDEFoundationAdditions.h"
+#import "NSMapTable+CDEAdditions.h"
 #import "CDEDefines.h"
 #import "CDEEventStore.h"
 #import "CDEPersistentStoreEnsemble.h"
@@ -20,17 +21,24 @@
 #import "CDERevisionSet.h"
 #import "CDERevision.h"
 
+@interface CDERebaser ()
+
+@property (nonatomic, readwrite, assign) BOOL forceRebase; // Used only for testing
+
+@end
 
 @implementation CDERebaser
 
 @synthesize eventStore = eventStore;
 @synthesize ensemble = ensemble;
+@synthesize forceRebase = forceRebase;
 
 - (instancetype)initWithEventStore:(CDEEventStore *)newStore
 {
     self = [super init];
     if (self) {
         eventStore = newStore;
+        forceRebase = NO;
     }
     return self;
 }
@@ -80,52 +88,70 @@
 
 #pragma mark Determining When to Rebase
 
-- (float)estimatedEventStoreCompactionFollowingRebase
+- (void)estimateEventStoreCompactionFollowingRebaseWithCompletion:(void(^)(float compaction))completion
 {
-    // Determine size of baseline
-    NSInteger currentBaselineCount = [self countOfBaseline];
-    
-    // Determine inserted, deleted, and updated changes outside baseline
-    NSInteger deletedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeDelete];
-    NSInteger insertedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeInsert];
-    NSInteger updatedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeUpdate];
-    
-    // Estimate size of baseline after rebasing.
-    // Assume that an insertion is 1 data unit.
-    // A deletion removes at least one insertion, so it is worth 1 data unit.
-    // An update is usually to some subset of properties. Assume it has weight 0.2 data units.
-    float postRebaseSize = currentBaselineCount - deletedCount + insertedCount;
-
-    // Estimate compaction
-    float currentSize = currentBaselineCount + insertedCount + 0.2*updatedCount;
-    float compaction = 1.0f - ( postRebaseSize / (float)MAX(1,currentSize) );
-    compaction = MIN( MAX(compaction, 0.0f), 1.0f);
-    
-    return compaction;
+    NSParameterAssert(completion);
+    [self.eventStore.managedObjectContext performBlock:^{
+        // Determine size of baseline
+        NSInteger currentBaselineCount = [self countOfBaseline];
+        
+        // Determine inserted, deleted, and updated changes outside baseline
+        NSInteger deletedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeDelete];
+        NSInteger insertedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeInsert];
+        NSInteger updatedCount = [self countOfNonBaselineObjectChangesOfType:CDEObjectChangeTypeUpdate];
+        
+        // Estimate size of baseline after rebasing.
+        // Assume that an insertion is 1 data unit.
+        // A deletion removes at least one insertion, so it is worth 1 data unit.
+        // An update is usually to some subset of properties. Assume it has weight 0.2 data units.
+        float postRebaseSize = currentBaselineCount - deletedCount + insertedCount;
+        
+        // Estimate compaction
+        float currentSize = currentBaselineCount + insertedCount + 0.2*updatedCount;
+        float compaction = 1.0f - ( postRebaseSize / (float)MAX(1,currentSize) );
+        compaction = MIN( MAX(compaction, 0.0f), 1.0f);
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(compaction);
+        });
+    }];
 }
 
-- (BOOL)shouldRebase
+- (void)shouldRebaseWithCompletion:(void(^)(BOOL result))completion
 {
+    NSParameterAssert(completion);
+    
+    if (self.forceRebase) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(YES);
+        });
+        return;
+    }
+
     // Rebase if there are more than 500 object changes, or we can reduce data by more than 50%,
     // or if there is no baseline at all
     NSManagedObjectContext *context = eventStore.managedObjectContext;
-    __block BOOL hasBaseline = NO;
-    __block CDERevisionSet *baselineRevisionSet = nil;
-    [context performBlockAndWait:^{
+    [context performBlock:^{
+        BOOL hasBaseline = NO;
+        CDERevisionSet *baselineRevisionSet = nil;
         CDEStoreModificationEvent *baseline = [CDEStoreModificationEvent fetchMostRecentBaselineStoreModificationEventInManagedObjectContext:context];
         hasBaseline = baseline != nil;
         baselineRevisionSet = baseline.revisionSet;
+        
+        // Rebase if the baseline doesn't include all stores
+        CDERevisionManager *revisionManager = [[CDERevisionManager alloc] initWithEventStore:self.eventStore];
+        NSSet *allStores = revisionManager.allPersistentStoreIdentifiers;
+        BOOL hasAllDevicesInBaseline = [baselineRevisionSet.persistentStoreIdentifiers isEqualToSet:allStores];
+        
+        BOOL hasManyEvents = [self countOfStoreModificationEvents] > 50;
+        BOOL hasAdequateChanges = [self countOfAllObjectChanges] >= 500;
+        
+        [self estimateEventStoreCompactionFollowingRebaseWithCompletion:^(float compaction) {
+            BOOL compactionIsAdequate = compaction > 0.5f;
+            BOOL result = !hasBaseline || !hasAllDevicesInBaseline || hasManyEvents || (hasAdequateChanges && compactionIsAdequate);
+            if (completion) completion(result);
+        }];
     }];
-    
-    // Rebase if the baseline doesn't include all stores
-    CDERevisionManager *revisionManager = [[CDERevisionManager alloc] initWithEventStore:self.eventStore];
-    NSSet *allStores = revisionManager.allPersistentStoreIdentifiers;
-    BOOL hasAllDevicesInBaseline = [baselineRevisionSet.persistentStoreIdentifiers isEqualToSet:allStores];
-    
-    BOOL hasManyEvents = [self countOfStoreModificationEvents] > 50;
-    BOOL hasAdequateChanges = [self countOfAllObjectChanges] >= 500;
-    BOOL compactionIsAdequate = self.estimatedEventStoreCompactionFollowingRebase > 0.5f;
-    return !hasBaseline || !hasAllDevicesInBaseline || hasManyEvents || (hasAdequateChanges && compactionIsAdequate);
 }
 
 
@@ -205,7 +231,7 @@
 {
     // Create map of existing object changes
     [CDEStoreModificationEvent prefetchRelatedObjectsForStoreModificationEvents:@[baseline]];
-    NSMapTable *objectChangesByGlobalId = [NSMapTable strongToStrongObjectsMapTable];
+    NSMapTable *objectChangesByGlobalId = [NSMapTable cde_strongToStrongObjectsMapTable];
     NSSet *objectChanges = baseline.objectChanges;
     for (CDEObjectChange *change in objectChanges) {
         [objectChangesByGlobalId setObject:change forKey:change.globalIdentifier];
